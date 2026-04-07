@@ -275,7 +275,7 @@ export default function LoveMoodWebapp() {
       .on(
         "postgres_changes",
         {
-          event: "UPDATE",
+          event: "*",
           schema: "public",
           table: "love_state",
           filter: "id=eq.1",
