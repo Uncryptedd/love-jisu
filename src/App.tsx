@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { motion } from "motion/react";
 import { Heart } from "lucide-react";
+import { supabase } from "./supabase";
 
 const ADI_NAME = "Adi";
 const JISU_NAME = "Jisu";
@@ -13,7 +14,7 @@ const moods = [
   { label: "sleepyski", emoji: "😴" },
   { label: "sadski", emoji: "🥺" },
   { label: "stressedski", emoji: "😵‍💫" },
-];
+] as const;
 
 const BACKGROUND_HEARTS = [
   { left: "6%", top: "14%", size: "text-2xl", duration: 6, delay: 0.2, opacity: "opacity-40", emoji: "💗" },
@@ -27,17 +28,30 @@ const BACKGROUND_HEARTS = [
   { left: "50%", top: "88%", size: "text-xl", duration: 7.8, delay: 1.3, opacity: "opacity-25", emoji: "💘" },
 ];
 
-const HER_LOVE_KEY = "love-app-her-meter";
-const MY_LOVE_KEY = "love-app-my-meter";
-const MOOD_KEY = "love-app-mood";
-const LOVE_LOG_KEY = "love-app-daily-log";
-const LAST_DECAY_KEY = "love-app-last-decay-at";
-
 const DEFAULT_HER_LOVE = 35;
 const DEFAULT_MY_LOVE = 40;
 const LOVE_STEP = 10;
 const DECAY_STEP = 1;
 const DECAY_INTERVAL_MS = 864000;
+
+type MoodOption = (typeof moods)[number];
+
+type DayLog = {
+  toHer: number;
+  toMe: number;
+};
+
+type DailyLog = Record<string, DayLog>;
+
+type LoveStateRow = {
+  id: number;
+  her_love: number;
+  my_love: number;
+  mood: string;
+  daily_log: DailyLog;
+  last_decay_at: string;
+  updated_at?: string;
+};
 
 function clampLove(value: number) {
   return Math.max(0, Math.min(100, value));
@@ -80,6 +94,35 @@ function getMonthLabel(date = new Date()) {
   });
 }
 
+function getMoodByLabel(label: string): MoodOption {
+  return moods.find((mood) => mood.label === label) ?? moods[1];
+}
+
+function applyDecay(row: LoveStateRow) {
+  const checkpoint = new Date(row.last_decay_at).getTime();
+  const now = Date.now();
+  const safeCheckpoint = Number.isNaN(checkpoint) ? now : checkpoint;
+  const elapsed = now - safeCheckpoint;
+  const decaySteps = Math.floor(elapsed / DECAY_INTERVAL_MS);
+
+  if (decaySteps <= 0) {
+    return {
+      row,
+      changed: false,
+    };
+  }
+
+  return {
+    changed: true,
+    row: {
+      ...row,
+      her_love: clampLove(row.her_love - decaySteps * DECAY_STEP),
+      my_love: clampLove(row.my_love - decaySteps * DECAY_STEP),
+      last_decay_at: new Date(safeCheckpoint + decaySteps * DECAY_INTERVAL_MS).toISOString(),
+    },
+  };
+}
+
 function Meter({ name, value }: { name: string; value: number }) {
   const percentage = clampLove(value);
 
@@ -101,17 +144,12 @@ function Meter({ name, value }: { name: string; value: number }) {
         />
       </div>
 
-      <p className="text-[11px] text-gray-500 mt-2">Drains by 1% every 864 seconds, even while the app is closed.</p>
+      <p className="text-[11px] text-gray-500 mt-2">
+        Drains by 1% every 864 seconds, even while the app is closed.
+      </p>
     </div>
   );
 }
-
-type DayLog = {
-  toHer: number;
-  toMe: number;
-};
-
-type DailyLog = Record<string, DayLog>;
 
 function CalendarCell({
   item,
@@ -158,107 +196,149 @@ function CalendarCell({
 }
 
 export default function LoveMoodWebapp() {
-  const [herMood, setHerMood] = useState(moods[1]);
+  const [herMood, setHerMood] = useState<MoodOption>(moods[1]);
   const [herLove, setHerLove] = useState(DEFAULT_HER_LOVE);
   const [myLove, setMyLove] = useState(DEFAULT_MY_LOVE);
   const [lastSent, setLastSent] = useState(STATUS_TEXT);
   const [dailyLog, setDailyLog] = useState<DailyLog>({});
+  const [lastDecayAt, setLastDecayAt] = useState(new Date().toISOString());
   const [isLoaded, setIsLoaded] = useState(false);
 
+  const applyRowToState = (row: LoveStateRow) => {
+    setHerLove(row.her_love);
+    setMyLove(row.my_love);
+    setHerMood(getMoodByLabel(row.mood));
+    setDailyLog(row.daily_log ?? {});
+    setLastDecayAt(row.last_decay_at);
+  };
+
+  const saveSharedState = async (next: {
+    herLove: number;
+    myLove: number;
+    mood: string;
+    dailyLog: DailyLog;
+    lastDecayAt: string;
+  }) => {
+    const { error } = await supabase.from("love_state").upsert({
+      id: 1,
+      her_love: next.herLove,
+      my_love: next.myLove,
+      mood: next.mood,
+      daily_log: next.dailyLog,
+      last_decay_at: next.lastDecayAt,
+      updated_at: new Date().toISOString(),
+    });
+
+    if (error) {
+      console.error("Failed to save shared state:", error);
+    }
+  };
+
   useEffect(() => {
-    const savedHerLove = Number(localStorage.getItem(HER_LOVE_KEY));
-    const savedMyLove = Number(localStorage.getItem(MY_LOVE_KEY));
-    const savedMood = localStorage.getItem(MOOD_KEY);
-    const savedLog = localStorage.getItem(LOVE_LOG_KEY);
-    const savedCheckpoint = Number(localStorage.getItem(LAST_DECAY_KEY));
-    const now = Date.now();
+    const loadSharedState = async () => {
+      const { data, error } = await supabase
+        .from("love_state")
+        .select("*")
+        .eq("id", 1)
+        .single();
 
-    const startingHerLove = Number.isNaN(savedHerLove) ? DEFAULT_HER_LOVE : clampLove(savedHerLove);
-    const startingMyLove = Number.isNaN(savedMyLove) ? DEFAULT_MY_LOVE : clampLove(savedMyLove);
-    const checkpoint = !Number.isNaN(savedCheckpoint) && savedCheckpoint > 0 ? savedCheckpoint : now;
-    const elapsed = now - checkpoint;
-    const decaySteps = Math.floor(elapsed / DECAY_INTERVAL_MS);
-
-    setHerLove(clampLove(startingHerLove - decaySteps * DECAY_STEP));
-    setMyLove(clampLove(startingMyLove - decaySteps * DECAY_STEP));
-
-    if (savedMood) {
-      const foundMood = moods.find((mood) => mood.label === savedMood);
-      if (foundMood) setHerMood(foundMood);
-    }
-
-    if (savedLog) {
-      try {
-        setDailyLog(JSON.parse(savedLog));
-      } catch {
-        setDailyLog({});
+      if (error) {
+        console.error("Failed to load shared state:", error);
+        return;
       }
-    }
 
-    localStorage.setItem(LAST_DECAY_KEY, String(checkpoint + decaySteps * DECAY_INTERVAL_MS));
-    setIsLoaded(true);
+      const row = data as LoveStateRow;
+      const result = applyDecay(row);
+
+      applyRowToState(result.row);
+      setIsLoaded(true);
+
+      if (result.changed) {
+        await saveSharedState({
+          herLove: result.row.her_love,
+          myLove: result.row.my_love,
+          mood: result.row.mood,
+          dailyLog: result.row.daily_log ?? {},
+          lastDecayAt: result.row.last_decay_at,
+        });
+      }
+    };
+
+    void loadSharedState();
   }, []);
 
   useEffect(() => {
     if (!isLoaded) return;
-    localStorage.setItem(HER_LOVE_KEY, String(herLove));
-  }, [herLove, isLoaded]);
+
+    const channel = supabase
+      .channel("love-state-live")
+      .on(
+        "postgres_changes",
+        {
+          event: "UPDATE",
+          schema: "public",
+          table: "love_state",
+          filter: "id=eq.1",
+        },
+        (payload) => {
+          const row = payload.new as LoveStateRow;
+          applyRowToState(row);
+          setLastSent(STATUS_TEXT);
+        }
+      )
+      .subscribe();
+
+    return () => {
+      void supabase.removeChannel(channel);
+    };
+  }, [isLoaded]);
 
   useEffect(() => {
     if (!isLoaded) return;
-    localStorage.setItem(MY_LOVE_KEY, String(myLove));
-  }, [myLove, isLoaded]);
 
-  useEffect(() => {
-    if (!isLoaded) return;
-    localStorage.setItem(MOOD_KEY, herMood.label);
-  }, [herMood, isLoaded]);
-
-  useEffect(() => {
-    if (!isLoaded) return;
-    localStorage.setItem(LOVE_LOG_KEY, JSON.stringify(dailyLog));
-  }, [dailyLog, isLoaded]);
-
-  useEffect(() => {
-    if (!isLoaded) return;
-
-    const catchUpDecay = () => {
-      const savedCheckpoint = Number(localStorage.getItem(LAST_DECAY_KEY));
+    const syncDecay = async () => {
+      const checkpoint = new Date(lastDecayAt).getTime();
       const now = Date.now();
-      const checkpoint = !Number.isNaN(savedCheckpoint) && savedCheckpoint > 0 ? savedCheckpoint : now;
-      const elapsed = now - checkpoint;
+      const safeCheckpoint = Number.isNaN(checkpoint) ? now : checkpoint;
+      const elapsed = now - safeCheckpoint;
       const decaySteps = Math.floor(elapsed / DECAY_INTERVAL_MS);
 
       if (decaySteps <= 0) return;
 
-      setHerLove((prev) => clampLove(prev - decaySteps * DECAY_STEP));
-      setMyLove((prev) => clampLove(prev - decaySteps * DECAY_STEP));
-      localStorage.setItem(LAST_DECAY_KEY, String(checkpoint + decaySteps * DECAY_INTERVAL_MS));
+      const nextHerLove = clampLove(herLove - decaySteps * DECAY_STEP);
+      const nextMyLove = clampLove(myLove - decaySteps * DECAY_STEP);
+      const nextLastDecayAt = new Date(safeCheckpoint + decaySteps * DECAY_INTERVAL_MS).toISOString();
+
+      setHerLove(nextHerLove);
+      setMyLove(nextMyLove);
+      setLastDecayAt(nextLastDecayAt);
+
+      await saveSharedState({
+        herLove: nextHerLove,
+        myLove: nextMyLove,
+        mood: herMood.label,
+        dailyLog,
+        lastDecayAt: nextLastDecayAt,
+      });
     };
 
-    const interval = window.setInterval(catchUpDecay, 1000);
+    const interval = window.setInterval(() => {
+      void syncDecay();
+    }, 1000);
 
     const handleVisibilityChange = () => {
       if (document.visibilityState === "visible") {
-        catchUpDecay();
-      } else {
-        localStorage.setItem(LAST_DECAY_KEY, String(Date.now()));
+        void syncDecay();
       }
     };
 
-    const handlePageHide = () => {
-      localStorage.setItem(LAST_DECAY_KEY, String(Date.now()));
-    };
-
     document.addEventListener("visibilitychange", handleVisibilityChange);
-    window.addEventListener("pagehide", handlePageHide);
 
     return () => {
       window.clearInterval(interval);
       document.removeEventListener("visibilitychange", handleVisibilityChange);
-      window.removeEventListener("pagehide", handlePageHide);
     };
-  }, [isLoaded]);
+  }, [isLoaded, herLove, myLove, herMood, dailyLog, lastDecayAt]);
 
   const totalLove = useMemo(() => Math.round((herLove + myLove) / 2), [herLove, myLove]);
   const monthDays = useMemo(() => getMonthDays(new Date()), []);
@@ -266,37 +346,83 @@ export default function LoveMoodWebapp() {
   const today = todayKey();
   const todayStats = dailyLog[today] ?? { toHer: 0, toMe: 0 };
 
-  const updateLog = (type: keyof DayLog) => {
-    const key = todayKey();
-    setDailyLog((prev) => {
-      const existing = prev[key] ?? { toHer: 0, toMe: 0 };
-      return {
-        ...prev,
-        [key]: {
-          ...existing,
-          [type]: existing[type] + 1,
-        },
-      };
+  const changeMood = async (mood: MoodOption) => {
+    setHerMood(mood);
+
+    await saveSharedState({
+      herLove,
+      myLove,
+      mood: mood.label,
+      dailyLog,
+      lastDecayAt,
     });
   };
 
-  const sendLoveToHer = () => {
-    setHerLove((prev) => clampLove(prev + LOVE_STEP));
+  const sendLoveToHer = async () => {
+    const key = todayKey();
+    const existing = dailyLog[key] ?? { toHer: 0, toMe: 0 };
+    const nextDailyLog = {
+      ...dailyLog,
+      [key]: {
+        ...existing,
+        toHer: existing.toHer + 1,
+      },
+    };
+    const nextHerLove = clampLove(herLove + LOVE_STEP);
+
+    setHerLove(nextHerLove);
+    setDailyLog(nextDailyLog);
     setLastSent(STATUS_TEXT);
-    updateLog("toHer");
+
+    await saveSharedState({
+      herLove: nextHerLove,
+      myLove,
+      mood: herMood.label,
+      dailyLog: nextDailyLog,
+      lastDecayAt,
+    });
   };
 
-  const sendLoveToMe = () => {
-    setMyLove((prev) => clampLove(prev + LOVE_STEP));
+  const sendLoveToMe = async () => {
+    const key = todayKey();
+    const existing = dailyLog[key] ?? { toHer: 0, toMe: 0 };
+    const nextDailyLog = {
+      ...dailyLog,
+      [key]: {
+        ...existing,
+        toMe: existing.toMe + 1,
+      },
+    };
+    const nextMyLove = clampLove(myLove + LOVE_STEP);
+
+    setMyLove(nextMyLove);
+    setDailyLog(nextDailyLog);
     setLastSent(STATUS_TEXT);
-    updateLog("toMe");
+
+    await saveSharedState({
+      herLove,
+      myLove: nextMyLove,
+      mood: herMood.label,
+      dailyLog: nextDailyLog,
+      lastDecayAt,
+    });
   };
 
-  const resetMeters = () => {
+  const resetMeters = async () => {
+    const nextLastDecayAt = new Date().toISOString();
+
     setHerLove(DEFAULT_HER_LOVE);
     setMyLove(DEFAULT_MY_LOVE);
-    localStorage.setItem(LAST_DECAY_KEY, String(Date.now()));
+    setLastDecayAt(nextLastDecayAt);
     setLastSent(STATUS_TEXT);
+
+    await saveSharedState({
+      herLove: DEFAULT_HER_LOVE,
+      myLove: DEFAULT_MY_LOVE,
+      mood: herMood.label,
+      dailyLog,
+      lastDecayAt: nextLastDecayAt,
+    });
   };
 
   let todayLeader = "No love has been logged today yet.";
@@ -355,7 +481,7 @@ export default function LoveMoodWebapp() {
             <div className="grid lg:grid-cols-[1.2fr_0.9fr] gap-6">
               <div>
                 <div className="mb-8">
-                  <p className="text-lg font-semibold mb-4 text-center">How u feelin today ma naesalanggg</p>
+                  <p className="text-lg font-semibold mb-4 text-center">How u feelin today 내 사랑</p>
                   <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
                     {moods.map((mood) => {
                       const selected = herMood.label === mood.label;
@@ -363,7 +489,7 @@ export default function LoveMoodWebapp() {
                       return (
                         <button
                           key={mood.label}
-                          onClick={() => setHerMood(mood)}
+                          onClick={() => void changeMood(mood)}
                           className={`rounded-2xl p-4 border transition-all text-left ${
                             selected
                               ? "bg-pink-100 border-pink-300 shadow-md scale-[1.02]"
@@ -383,26 +509,26 @@ export default function LoveMoodWebapp() {
                   <p className="text-3xl font-bold mb-1">
                     {herMood.emoji} {herMood.label}
                   </p>
-                  <p className="text-sm text-gray-600">Shared love level: {totalLove}%</p>
+                  <p className="text-sm text-gray-600">How much luh u sent: {totalLove}%</p>
                 </div>
 
                 <div className="grid md:grid-cols-3 gap-3 mb-6">
                   <button
-                    onClick={sendLoveToHer}
+                    onClick={() => void sendLoveToHer()}
                     className="rounded-2xl px-5 py-4 bg-pink-500 text-white font-semibold shadow-lg hover:scale-[1.01] active:scale-[0.99] transition"
                   >
                     send jisu luh 💗
                   </button>
 
                   <button
-                    onClick={sendLoveToMe}
+                    onClick={() => void sendLoveToMe()}
                     className="rounded-2xl px-5 py-4 bg-rose-500 text-white font-semibold shadow-lg hover:scale-[1.01] active:scale-[0.99] transition"
                   >
                     send adi luh ❤️
                   </button>
 
                   <button
-                    onClick={resetMeters}
+                    onClick={() => void resetMeters()}
                     className="rounded-2xl px-5 py-4 bg-white text-gray-700 font-semibold border border-gray-200 hover:bg-gray-50 transition"
                   >
                     Reset hearts
